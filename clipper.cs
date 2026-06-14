@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
@@ -58,6 +58,8 @@ static class Program
     static void Main()
     {
         File.WriteAllText(LogFile, $"--- session {DateTime.Now} ---\n");
+        System.Diagnostics.Process.GetCurrentProcess().PriorityClass =
+            System.Diagnostics.ProcessPriorityClass.BelowNormal;
         try
         {
             Application.EnableVisualStyles();
@@ -270,7 +272,7 @@ static class GameDetector
     };
 
     static readonly HashSet<char>   _invalidFileChars = new(Path.GetInvalidFileNameChars());
-    static readonly char[]          _titleSeps        = ['|', '-', '—', '·', ':'];
+    static readonly char[]          _titleSeps        = ['|', '-', '-', '-', ':'];
     static readonly HashSet<string> _skip = new(StringComparer.OrdinalIgnoreCase) {
         "explorer","chrome","firefox","msedge","opera","brave","iexplore",
         "discord","slack","teams","zoom","skype","telegram","whatsapp",
@@ -328,7 +330,7 @@ static class GameDetector
 
 public record DisplayInfo(Rectangle Rect, string Label)
 {
-    public override string ToString() => $"{Label}  ({Rect.Width}×{Rect.Height})";
+    public override string ToString() => $"{Label}  ({Rect.Width}x{Rect.Height})";
 }
 
 static class DisplayHelper
@@ -571,7 +573,7 @@ sealed class ClipToast : Form
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
         g.Clear(Color.FromArgb(0x18, 0x18, 0x18));
         g.FillEllipse(_brDot, 10, Height / 2 - 5, 10, 10);
-        g.DrawString("Saving clip…", _font, _brText, new RectangleF(26, 0, Width - 30, Height),
+        g.DrawString("Saving clip...", _font, _brText, new RectangleF(26, 0, Width - 30, Height),
             new StringFormat { LineAlignment = StringAlignment.Center });
     }
 
@@ -865,7 +867,7 @@ public class HotkeyCapture : Control
         g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
 
         if (listening)
-            g.DrawString("Press keys…", Font, _brHint,
+            g.DrawString("Press keys...", Font, _brHint,
                 new RectangleF(8, 0, Width - 16, Height), _hkSf);
         else
             g.DrawString(current, Font, _brText,
@@ -1432,7 +1434,8 @@ public class LoopbackRecorder : IDisposable
 
     public static string? DefaultOutputDeviceName()
     {
-        CoInitializeEx(IntPtr.Zero, 0);
+        int hr = CoInitializeEx(IntPtr.Zero, 0);
+        if (hr < 0) return null;
         try {
             var c = MMDevEnum_CLSID; var i = MMDevEnum_IID;
             if (CoCreateInstance(ref c, IntPtr.Zero, CLSCTX_ALL, ref i, out var raw) != S_OK) return null;
@@ -1449,7 +1452,8 @@ public class LoopbackRecorder : IDisposable
     public static List<string> ListOutputDevices()
     {
         var result = new List<string>();
-        CoInitializeEx(IntPtr.Zero, 0);
+        int hr = CoInitializeEx(IntPtr.Zero, 0);
+        if (hr < 0) return result;
         try {
             var c = MMDevEnum_CLSID; var i = MMDevEnum_IID;
             if (CoCreateInstance(ref c, IntPtr.Zero, CLSCTX_ALL, ref i, out var raw) != S_OK) return result;
@@ -1470,12 +1474,13 @@ public class LoopbackRecorder : IDisposable
     public static List<string> ListInputDevices()
     {
         var result = new List<string>();
-        CoInitializeEx(IntPtr.Zero, 0);
+        int hr = CoInitializeEx(IntPtr.Zero, 0);
+        if (hr < 0) return result;
         try {
             var c = MMDevEnum_CLSID; var i = MMDevEnum_IID;
             if (CoCreateInstance(ref c, IntPtr.Zero, CLSCTX_ALL, ref i, out var raw) != S_OK) return result;
             var e = (IMMDeviceEnumerator)raw;
-            e.EnumAudioEndpoints(1, 1, out var col);  
+            e.EnumAudioEndpoints(1, 1, out var col);
             col.GetCount(out uint n);
             for (uint j = 0; j < n; j++) {
                 col.Item(j, out var dev);
@@ -1694,6 +1699,10 @@ public class ScreenGrabber
     [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public POINT pt; }
     const int CURSOR_SHOWING = 1; const uint DI_NORMAL = 3;
 
+    static void CLog(string msg) {
+        try { File.AppendAllText(Program.LogFile, $"[{DateTime.Now:HH:mm:ss}] {msg}\n"); } catch { }
+    }
+
     readonly Rectangle captureRect;
     readonly Size outputSize;
     readonly int targetFps;
@@ -1752,8 +1761,16 @@ public class ScreenGrabber
 
     public void Run()
     {
-        if (!TryRunDxgi() && !TryRunDxgi())
-            RunGdi();
+        Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+        CLog($"capture: starting encoder={_encoder} ffmpeg={_ffmpegPath}");
+        if (TryRunDdagrab() || cancel.IsCancellationRequested) { CLog("capture: exited ddagrab path"); return; }
+        CLog("capture: ddagrab failed, trying DXGI");
+        if (TryRunDxgi() || cancel.IsCancellationRequested) { CLog("capture: exited DXGI path (attempt 1)"); return; }
+        CLog("capture: DXGI attempt 1 failed, retrying");
+        if (TryRunDxgi() || cancel.IsCancellationRequested) { CLog("capture: exited DXGI path (attempt 2)"); return; }
+        CLog("capture: falling back to GDI");
+        RunGdi();
+        CLog("capture: exited GDI path");
     }
 
     void RunGdi()
@@ -1762,7 +1779,6 @@ public class ScreenGrabber
 
         using var bmp       = new Bitmap(captureRect.Width, captureRect.Height, PixelFormat.Format32bppArgb);
         using var gfx       = Graphics.FromImage(bmp);
-        using var ms        = new MemoryStream(256 * 1024);
         using var scaled    = needsScale ? new Bitmap(outputSize.Width, outputSize.Height, PixelFormat.Format32bppArgb) : null;
         using var scaledGfx = scaled != null ? Graphics.FromImage(scaled) : null;
         if (scaledGfx != null)
@@ -1771,6 +1787,26 @@ public class ScreenGrabber
             scaledGfx.SmoothingMode     = System.Drawing.Drawing2D.SmoothingMode.None;
             scaledGfx.PixelOffsetMode   = System.Drawing.Drawing2D.PixelOffsetMode.None;
         }
+
+        var encChan = System.Threading.Channels.Channel.CreateBounded<(Bitmap, double)>(
+            new System.Threading.Channels.BoundedChannelOptions(2) {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+            });
+        _ = Task.Run(async () => {
+            using var encMs = new MemoryStream(256 * 1024);
+            try {
+                await foreach (var (b, t) in encChan.Reader.ReadAllAsync(cancel)) {
+                    using (b) {
+                        encMs.SetLength(0);
+                        b.Save(encMs, JpegEncoder, EncParams);
+                        int flen  = (int)encMs.Length;
+                        var frame = GC.AllocateUninitializedArray<byte>(flen);
+                        encMs.GetBuffer().AsSpan(0, flen).CopyTo(frame);
+                        frameCallback(frame, t);
+                    }
+                }
+            } catch (OperationCanceledException) { }
+        });
 
         var sw             = Stopwatch.StartNew();
         long ticksPerFrame = (long)(Stopwatch.Frequency / (double)targetFps);
@@ -1814,12 +1850,7 @@ public class ScreenGrabber
                         scaledGfx!.DrawImage(bmp, 0, 0, outputSize.Width, outputSize.Height);
                         toEncode = scaled!;
                     }
-                    ms.SetLength(0);
-                    toEncode.Save(ms, JpegEncoder, EncParams);
-                    int frameLen = (int)ms.Length;
-                    var frame = GC.AllocateUninitializedArray<byte>(frameLen);
-                    ms.GetBuffer().AsSpan(0, frameLen).CopyTo(frame);
-                    frameCallback(frame, ts);
+                    encChan.Writer.TryWrite(((Bitmap)toEncode.Clone(), ts));
                 }
 
                 frameCount++;
@@ -1840,6 +1871,162 @@ public class ScreenGrabber
             }
         }
         finally { timeEndPeriod(1); }
+    }
+
+    bool TryRunDdagrab()
+    {
+        if (_ffmpegPath == null) { CLog("ddagrab: no ffmpeg path"); return false; }
+
+        int globalOutputIdx = 0, foundIdx = -1;
+        var fid = _IIDFactory1;
+        if (CreateDXGIFactory1(ref fid, out var factObj) == 0)
+        {
+            var factory = (IDXGIFactory1)factObj;
+            for (uint ai = 0; foundIdx < 0; ai++)
+            {
+                if (factory.EnumAdapters1(ai, out var adObj) != 0) break;
+                if (adObj is IDXGIAdapter1 ad)
+                {
+                    for (uint oi = 0; ; oi++)
+                    {
+                        if (ad.EnumOutputs(oi, out var outObj) != 0) break;
+                        if (outObj is IDXGIOutput outBase && outBase.GetDesc(out var desc) == 0)
+                        {
+                            var r = new Rectangle(desc.left, desc.top,
+                                                  desc.right - desc.left, desc.bottom - desc.top);
+                            CLog($"ddagrab: adapter={ai} output={oi} globalIdx={globalOutputIdx} rect={r} captureRect={captureRect} intersects={r.IntersectsWith(captureRect)}");
+                            if (r.IntersectsWith(captureRect)) foundIdx = globalOutputIdx;
+                        }
+                        Marshal.ReleaseComObject(outObj);
+                        globalOutputIdx++;
+                    }
+                    Marshal.ReleaseComObject(adObj);
+                }
+            }
+            Marshal.ReleaseComObject(factObj);
+        }
+        int outIdx = foundIdx >= 0 ? foundIdx : 0;
+        CLog($"ddagrab: using output index {outIdx} (foundIdx={foundIdx}) encoder={_encoder}");
+
+        try
+        {
+            var probe = new ProcessStartInfo(_ffmpegPath) {
+                UseShellExecute = false, RedirectStandardError = true, CreateNoWindow = true
+            };
+            foreach (var a in new[] {
+                "-f", "lavfi",
+                "-i", $"ddagrab=output_idx={outIdx}:framerate=30:draw_mouse=0",
+                "-frames:v", "1", "-f", "null", "-"
+            }) probe.ArgumentList.Add(a);
+            using var pp = Process.Start(probe)!;
+            var stderr = pp.StandardError.ReadToEndAsync();
+            if (!pp.WaitForExit(5000)) { pp.Kill(); pp.WaitForExit(); CLog("ddagrab: probe timed out"); return false; }
+            CLog($"ddagrab: probe exit={pp.ExitCode} stderr={stderr.Result?.Trim()}");
+            if (pp.ExitCode != 0) return false;
+        }
+        catch (Exception ex) { CLog($"ddagrab: probe exception {ex.Message}"); return false; }
+
+        bool needsScale = outputSize.Width != captureRect.Width || outputSize.Height != captureRect.Height;
+
+        var args = new List<string> {
+            "-f", "lavfi",
+            "-i", $"ddagrab=output_idx={outIdx}:framerate={targetFps.ToString(System.Globalization.CultureInfo.InvariantCulture)}:draw_mouse={(drawCursor ? 1 : 0)}",
+        };
+
+        {
+            string sc = needsScale ? $",scale={outputSize.Width}:{outputSize.Height}" : "";
+            args.AddRange(["-vf", $"hwdownload,format=bgra{sc}"]);
+        }
+
+        switch (_encoder)
+        {
+            case "h264_nvenc":
+                args.AddRange(["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "cbr",
+                    "-b:v", "8M", "-g", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            case "h264_amf":
+                args.AddRange(["-c:v", "h264_amf", "-quality", "speed",
+                    "-gops_per_idr", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            case "h264_qsv":
+                args.AddRange(["-c:v", "h264_qsv", "-preset", "veryfast",
+                    "-g", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            default:
+                args.AddRange(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                    "-g", "1", "-bf", "0", "-x264-params", "repeat_headers=1"]);
+                break;
+        }
+        args.AddRange(["-f", "h264", "pipe:1"]);
+
+        var psi = new ProcessStartInfo(_ffmpegPath) {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow         = true,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+
+        Process? proc = null;
+        try
+        {
+            proc = Process.Start(psi);
+            if (proc == null) { CLog("ddagrab: capture process start returned null"); return false; }
+            var captureStderr = proc.StandardError.ReadToEndAsync();
+
+            var    acc       = new MemoryStream(256 * 1024);
+            var    buf       = new byte[65536];
+            var    stream    = proc.StandardOutput.BaseStream;
+            double startTs   = (DateTime.UtcNow - DateTime.UnixEpoch).TotalSeconds;
+            long   startTick = Stopwatch.GetTimestamp();
+            int    fpsCount  = 0;
+            long   fpsMark   = startTick;
+            int    n;
+
+            while (!cancel.IsCancellationRequested && (n = stream.Read(buf, 0, buf.Length)) > 0)
+            {
+                int seg = 0;
+                for (int i = 0; i <= n - 5; i++)
+                {
+                    if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1
+                        && (buf[i+4] & 0x1F) == 7)
+                    {
+                        acc.Write(buf, seg, i - seg);
+                        if (acc.Length > 0)
+                        {
+                            double ts  = startTs + (double)(Stopwatch.GetTimestamp() - startTick) / Stopwatch.Frequency;
+                            int    len = (int)acc.Length;
+                            var    frame = GC.AllocateUninitializedArray<byte>(len);
+                            acc.GetBuffer().AsSpan(0, len).CopyTo(frame);
+                            frameCallback(frame, ts);
+                            fpsCount++;
+                            long now = Stopwatch.GetTimestamp();
+                            if ((double)(now - fpsMark) / Stopwatch.Frequency >= 1.0)
+                            { ActualFps = fpsCount; fpsCount = 0; fpsMark = now; }
+                        }
+                        acc.SetLength(0);
+                        seg = i;
+                    }
+                }
+                acc.Write(buf, seg, n - seg);
+            }
+
+            bool ok = !cancel.IsCancellationRequested;
+            try { proc.WaitForExit(500); } catch { }
+            int exitCode = proc.HasExited ? proc.ExitCode : -1;
+            string lastErr = captureStderr.IsCompleted ? (captureStderr.Result ?? "").Split('\n')[^1].Trim() : "stderr pending";
+            CLog($"ddagrab: capture ended frames={fpsCount} cancelled={!ok} exitCode={exitCode} stderr={lastErr}");
+            return ok;
+        }
+        catch (Exception ex) { CLog($"ddagrab: capture exception {ex.GetType().Name}: {ex.Message}"); return false; }
+        finally
+        {
+            if (proc != null)
+            {
+                try { if (!proc.HasExited) proc.Kill(); } catch { }
+                proc.Dispose();
+            }
+        }
     }
 
     static readonly Guid _IIDFactory1 = new("770aae78-f26f-4dba-a829-253c83d1b387");
@@ -2142,7 +2329,7 @@ static class ClipEncoder
         Action<bool, string>? onFinished = null)
     {
         if (videoFrames.Count == 0) {
-            onFinished?.Invoke(false, "No frames buffered yet — wait a moment after startup");
+            onFinished?.Invoke(false, "No frames buffered yet - wait a moment after startup");
             return;
         }
 
@@ -2288,7 +2475,7 @@ static class ClipEncoder
             else
             {
 
-                string errSnip = stderr.Length > 300 ? "…" + stderr[^300..] : stderr;
+                string errSnip = stderr.Length > 300 ? "..." + stderr[^300..] : stderr;
                 onFinished?.Invoke(false, errSnip);
             }
         }
@@ -2298,8 +2485,10 @@ static class ClipEncoder
     {
         foreach (var enc in new[] { "h264_nvenc", "h264_amf", "h264_qsv" }) {
             try {
-                var psi = new ProcessStartInfo(ffmpegPath,
-                    $"-f lavfi -i nullsrc=s=64x64:d=0.1 -c:v {enc} -f null -") {
+                string args = enc == "h264_amf"
+                    ? "-f lavfi -i ddagrab=output_idx=0:framerate=30:draw_mouse=0 -vf hwdownload,format=bgra -c:v h264_amf -frames:v 1 -f null -"
+                    : $"-f lavfi -i nullsrc=s=64x64:d=0.1 -vf format=nv12 -c:v {enc} -frames:v 1 -f null -";
+                var psi = new ProcessStartInfo(ffmpegPath, args) {
                     UseShellExecute = false, RedirectStandardError = true, CreateNoWindow = true,
                 };
                 using var p = Process.Start(psi)!;
@@ -2442,9 +2631,9 @@ public sealed class ClipEditorForm : Form
         _clip   = path;
         _backup = MakeBackupPath(path);
         string fname = Path.GetFileName(path);
-        _fileLabel.Text = fname.Length > 62 ? "…" + fname[^59..] : fname;
+        _fileLabel.Text = fname.Length > 62 ? "..." + fname[^59..] : fname;
         _trim.SetRange(0);
-        _status.Text = "Loading…";
+        _status.Text = "Loading...";
         _ = LoadDurationAsync();
     }
 
@@ -2466,7 +2655,7 @@ public sealed class ClipEditorForm : Form
         var tb = new Panel { Location = new Point(0, y), Size = new Size(Width, 32), BackColor = TBAR };
         tb.Controls.Add(new Label { Text = "Edit Clip", ForeColor = FG, Font = DP.F(11f), BackColor = TBAR,
             Location = new Point(14, 0), Size = new Size(200, 32), TextAlign = ContentAlignment.MiddleLeft });
-        var xBtn = new Label { Text = "×", ForeColor = FG2, Font = DP.F(9f), BackColor = TBAR,
+        var xBtn = new Label { Text = "X", ForeColor = FG2, Font = DP.F(9f), BackColor = TBAR,
             Size = new Size(32, 32), TextAlign = ContentAlignment.MiddleCenter, Left = Width - 32, Cursor = Cursors.Hand };
         xBtn.Click += (_, _) => Close();
         xBtn.MouseEnter += (_, _) => xBtn.BackColor = Color.FromArgb(0xC4, 0x2B, 0x1D);
@@ -2482,11 +2671,11 @@ public sealed class ClipEditorForm : Form
 
         y += 6;
         string fname = Path.GetFileName(_clip);
-        _fileLabel = new Label { Text = fname.Length > 62 ? "…" + fname[^59..] : fname,
+        _fileLabel = new Label { Text = fname.Length > 62 ? "..." + fname[^59..] : fname,
             ForeColor = FG2, Font = DP.F(9f), BackColor = BG,
             Location = new Point(14, y), Size = new Size(Width - 90, 18), AutoEllipsis = true };
         Controls.Add(_fileLabel);
-        Controls.Add(new RoundButton("Browse…", BrowseClip, 68, 22) {
+        Controls.Add(new RoundButton("Browse...", BrowseClip, 68, 22) {
             Location = new Point(Width - 76, y - 2), Font = DP.F(8f)
         });
         y += 24;
@@ -2512,7 +2701,7 @@ public sealed class ClipEditorForm : Form
         Div(ref y);
         y += 4;
 
-        _status = new Label { Text = "Loading…", ForeColor = FG3, Font = DP.F(8f), BackColor = BG,
+        _status = new Label { Text = "Loading...", ForeColor = FG3, Font = DP.F(8f), BackColor = BG,
             Location = new Point(14, y), Size = new Size(Width - 28, 14) };
         Controls.Add(_status);
         y += 18;
@@ -2552,7 +2741,7 @@ public sealed class ClipEditorForm : Form
         }
     }
 
-    void RefreshStatus() => _status.Text = $"{_trim.TrimStart:F1}s → {_trim.TrimEnd:F1}s  ({_trim.TrimEnd - _trim.TrimStart:F1}s)";
+    void RefreshStatus() => _status.Text = $"{_trim.TrimStart:F1}s ? {_trim.TrimEnd:F1}s  ({_trim.TrimEnd - _trim.TrimStart:F1}s)";
 
     void OpenPreview() { try { Process.Start(new ProcessStartInfo(_clip) { UseShellExecute = true }); } catch { } }
 
@@ -2562,7 +2751,7 @@ public sealed class ClipEditorForm : Form
         if (!File.Exists(_backup)) { try { File.Copy(_clip, _backup, false); } catch { } }
         _busy = true;
         _saveBtn.Enabled = false;
-        _status.Text = "Saving…";
+        _status.Text = "Saving...";
 
         double start = _trim.TrimStart, end = _trim.TrimEnd;
         bool mute = _muteAudio.Checked;
@@ -2604,7 +2793,7 @@ public sealed class ClipEditorForm : Form
     void DoRevert()
     {
         if (_busy) return;
-        if (!File.Exists(_backup)) { _status.Text = "No backup — save the clip first to create one"; return; }
+        if (!File.Exists(_backup)) { _status.Text = "No backup - save the clip first to create one"; return; }
         try {
             File.Delete(_clip); File.Copy(_backup, _clip);
             _status.Text = "Reverted to original.";
@@ -2673,7 +2862,7 @@ public class SidebarOverlay : Form
     DropPicker    crfPicker      = null!;
 
     static readonly Dictionary<string, int> CrfMap = new() {
-        ["18 – High"] = 18, ["23 – Default"] = 23, ["28 – Small"] = 28, ["35 – Compact"] = 35
+        ["18 - High"] = 18, ["23 - Default"] = 23, ["28 - Small"] = 28, ["35 - Compact"] = 35
     };
 
     System.Windows.Forms.Timer slideTimer = null!;
@@ -2792,7 +2981,7 @@ public class SidebarOverlay : Form
         layoutY += 29;
 
         statusLabel = new Label {
-            Text = "Starting…", ForeColor = SFG2, Font = SSF8,
+            Text = "Starting...", ForeColor = SFG2, Font = SSF8,
             Location = new Point(PAD, layoutY), Size = new Size(PANEL_W - PAD * 2, 16), BackColor = SBG,
         };
         contentPanel.Controls.Add(statusLabel);
@@ -2935,7 +3124,7 @@ public class SidebarOverlay : Form
         if (fmtPicker.SelectedIndex < 0) fmtPicker.SelectedIndex = 0;
         curPicker.SelectedIndex = cfg.ShowCursor ? 0 : 1;
         var crfLabel = CrfMap.FirstOrDefault(kv => kv.Value == cfg.Crf).Key;
-        crfPicker.SelectedItem = crfLabel ?? "23 – Default";
+        crfPicker.SelectedItem = crfLabel ?? "23 - Default";
         if (crfPicker.SelectedIndex < 0) crfPicker.SelectedIndex = 1;
     }
 
@@ -2986,7 +3175,7 @@ public class SidebarOverlay : Form
         timeLabel.Text   = ram.Length > 0 ? $"{ram}  {time}" : time;
         ramLabel.Text    = "";
         statusLabel.Text = status;
-        frameDropLabel.Text = drops > 0 ? $"↓{drops} frm" : "";
+        frameDropLabel.Text = drops > 0 ? $"?{drops} frm" : "";
     }
 
 
@@ -3153,21 +3342,18 @@ public class MainForm : Form
             } catch { trayIcon.Icon = SystemIcons.Application; }
             trayIcon.DoubleClick += (_, _) => sidebar?.Toggle();
 
-            if (ffmpegExe != null)
-                Task.Run(() => { videoEncoder = ClipEncoder.ProbeEncoder(ffmpegExe); });
-
             blinkTimer = new System.Windows.Forms.Timer { Interval = 600 };
             blinkTimer.Tick += (_, _) => { dotBlink = !dotBlink; recDot.Invalidate(); };
             blinkTimer.Start();
 
-            tickTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            tickTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             tickTimer.Tick += (_, _) => RefreshTimecode();
 
             Visible = false;
             if (ffmpegExe == null)
-                statusLabel.Text = "ffmpeg not found — drop ffmpeg.exe next to Atlas.exe or add it to PATH";
+                statusLabel.Text = "ffmpeg not found - drop ffmpeg.exe next to Atlas.exe or add it to PATH";
             else
-                BeginInvoke(StartCapture);
+                Task.Run(() => { videoEncoder = ClipEncoder.ProbeEncoder(ffmpegExe); BeginInvoke(StartCapture); });
 
             BeginInvoke(() => ToggleSidebar(true));
         }
@@ -3235,8 +3421,8 @@ public class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft, BackColor = TBAR
         });
 
-        var closeBtn = TBarLabel("×");
-        var minBtn   = TBarLabel("—");
+        var closeBtn = TBarLabel("X");
+        var minBtn   = TBarLabel("X");
         closeBtn.Left = FORM_W - 38;
         minBtn.Left   = FORM_W - 76;
         bar.Controls.AddRange([closeBtn, minBtn]);
@@ -3381,7 +3567,7 @@ public class MainForm : Form
         layoutY += 38;
 
         statusLabel = new Label {
-            Text      = "Starting…",
+            Text      = "Starting...",
             ForeColor = FG3,
             Font      = F8,
             Location  = new Point(PAD, layoutY),
@@ -3423,7 +3609,7 @@ public class MainForm : Form
 
         audPicker.ClearItems();
         var defDev   = LoopbackRecorder.DefaultOutputDeviceName();
-        string defLabel = defDev != null ? $"Default — {defDev}" : "Default";
+        string defLabel = defDev != null ? $"Default - {defDev}" : "Default";
         var audItems = new string[audioDevs.Count + 1];
         audItems[0] = defLabel;
         audioDevs.CopyTo(audItems, 1);
@@ -3463,7 +3649,7 @@ public class MainForm : Form
         PersistSettings();
         Shutdown();
         progressBar.SetProgress(0, 1);
-        statusLabel.Text = "Restarting capture…";
+        statusLabel.Text = "Restarting capture...";
         var t = new System.Windows.Forms.Timer { Interval = 300 };
         t.Tick += (_, _) => { t.Stop(); t.Dispose(); StartCapture(); };
         t.Start();
@@ -3494,21 +3680,21 @@ public class MainForm : Form
         string outDir = cfg.OutDir;
         try { Directory.CreateDirectory(outDir); }
         catch (Exception ex) {
-            statusLabel.Text = $"⚠ Can't create output dir: {ex.Message}";
+            statusLabel.Text = $"? Can't create output dir: {ex.Message}";
             sidebar?.UpdateStatus("", statusLabel.Text, 0, 1);
             return;
         }
         string testFile = Path.Combine(outDir, ".atlas_write_test");
         try { File.WriteAllText(testFile, ""); File.Delete(testFile); }
         catch {
-            statusLabel.Text = $"⚠ Output dir is read-only: {outDir}";
+            statusLabel.Text = $"? Output dir is read-only: {outDir}";
             sidebar?.UpdateStatus("", statusLabel.Text, 0, 1);
             return;
         }
         try {
             var drive = new DriveInfo(Path.GetPathRoot(outDir) ?? "C:\\");
             if (drive.AvailableFreeSpace < 512L * 1024 * 1024)
-                statusLabel.Text = $"⚠ Low disk: {drive.AvailableFreeSpace / 1_000_000}MB free";
+                statusLabel.Text = $"? Low disk: {drive.AvailableFreeSpace / 1_000_000}MB free";
         } catch { }
 
         recCts?.Cancel();
@@ -3549,7 +3735,7 @@ public class MainForm : Form
 
         bool audioStarted = audioRec.Start();
         if (!audioStarted)
-            statusLabel.Text = "Audio device not responding — capturing video only";
+            statusLabel.Text = "Audio device not responding - capturing video only";
         captureFormat = audioRec.CaptureFormat;
 
         micAudBuf.WindowSecs = bufSecs; micAudBuf.Clear();
@@ -3584,7 +3770,7 @@ public class MainForm : Form
         _recWatch.Restart();
 
         if (hotkeyOk)
-            statusLabel.Text = $"Buffering  ·  {cfg.Hotkey}  saves the last {cfg.ClipLen}";
+            statusLabel.Text = $"Buffering  |  {cfg.Hotkey}  saves the last {cfg.ClipLen}";
 
         tickTimer.Start();
     }
@@ -3630,7 +3816,7 @@ public class MainForm : Form
     internal string[] GetAudioDeviceLabels() {
         var def = LoopbackRecorder.DefaultOutputDeviceName();
         var result = new string[audioDevs.Count + 1];
-        result[0] = def != null ? $"Default — {def}" : "Default";
+        result[0] = def != null ? $"Default - {def}" : "Default";
         for (int i = 0; i < audioDevs.Count; i++) result[i + 1] = audioDevs[i];
         return result;
     }
@@ -3712,7 +3898,7 @@ public class MainForm : Form
             return;
         }
         bool ok = RegisterHotKey(Handle, HK, mods | NO_REPEAT, vk);
-        if (!ok) statusLabel.Text = $"⚠ {hk} is taken by another app — click Hotkey and press a new combo";
+        if (!ok) statusLabel.Text = $"? {hk} is taken by another app - click Hotkey and press a new combo";
         hotkeyOk = ok;
     }
 
@@ -3729,9 +3915,9 @@ public class MainForm : Form
         }
 
         if (elapsed < 2 && statusLabel.Text.StartsWith("Buffering"))
-            statusLabel.Text = "Warming up…";
-        else if (elapsed >= 2 && statusLabel.Text == "Warming up…")
-            statusLabel.Text = $"Buffering  ·  {cfg.Hotkey}  saves the last {cfg.ClipLen}";
+            statusLabel.Text = "Warming up...";
+        else if (elapsed >= 2 && statusLabel.Text == "Warming up...")
+            statusLabel.Text = $"Buffering  |  {cfg.Hotkey}  saves the last {cfg.ClipLen}";
 
         long ramBytes = vidBuf.ApproxBytes + audBuf.ApproxBytes + micAudBuf.ApproxBytes;
         string ram = ramBytes >= 1_000_000 ? (ramBytes / 1_048_576) + "MB" : (ramBytes / 1024) + "KB";
@@ -3770,7 +3956,7 @@ public class MainForm : Form
         saving = true;
         Task.Run(PlaySaveChime);
 
-        statusLabel.Text = "Saving clip…";
+        statusLabel.Text = "Saving clip...";
 
         int clipSecs = DurationMap.TryGetValue(cfg.ClipLen, out int d) ? d : 30;
         int fps      = cfg.Fps > 0 ? cfg.Fps : 30;
@@ -3806,7 +3992,7 @@ public class MainForm : Form
             sidebar?.SetPreviewEnabled(true);
 
             int drops = audioRec?.LatePackets ?? 0;
-            string dropNote = drops > 0 ? $"  ·  {drops} late audio pkts" : "";
+            string dropNote = drops > 0 ? $"  |  {drops} late audio pkts" : "";
             string fileName = Path.GetFileName(path);
             statusLabel.Text = $"Saved {fileName} {meta}{dropNote}";
             trayIcon?.ShowBalloonTip(3000, "Clip saved", $"{fileName} {meta}", ToolTipIcon.None);
@@ -3851,7 +4037,7 @@ public class MainForm : Form
         string baseName = $"{GameDetector.Detect()}_{DateTime.Now:yyyyMMdd_HHmmss}";
         byte[]? lastJpg = frames.Count > 0 ? frames[^1].payload : null;
         saving = true;
-        statusLabel.Text = $"Saving {altSecs}s clip…";
+        statusLabel.Text = $"Saving {altSecs}s clip...";
         Task.Run(() => ClipEncoder.WriteClip(frames, audio, fmt, micAudio, micFmt, fps, dir, ff, clipFmt, videoEncoder, baseName, crf,
             (ok, info) => BeginInvoke(() => OnSaveComplete(ok, info, frames.Count, lastJpg))));
     }
@@ -3870,7 +4056,7 @@ public class MainForm : Form
             micAudioRec?.Stop();
             micAudioRec?.Dispose();
             micAudioRec = null;
-            statusLabel.Text = "🔇 Mic muted";
+            statusLabel.Text = "?? Mic muted";
         } else if (cfg.MicDevice != null) {
             var tok = recCts?.Token ?? CancellationToken.None;
             micAudBuf.Clear();
@@ -3880,14 +4066,14 @@ public class MainForm : Form
             }, captureMode: true);
             micAudioRec.Start();
             micCaptureFormat = micAudioRec.CaptureFormat;
-            statusLabel.Text = "🎙 Mic active";
+            statusLabel.Text = "?? Mic active";
         }
     }
 
     void RecoverFromCrash(Exception ex)
     {
         if (recCts?.IsCancellationRequested == true) return;
-        statusLabel.Text = "⚠ Capture crashed — restarting…";
+        statusLabel.Text = "? Capture crashed - restarting...";
         sidebar?.UpdateStatus(timeLabel.Text, statusLabel.Text, 0, 1);
         var t = new System.Windows.Forms.Timer { Interval = 1500 };
         t.Tick += (_, _) => { t.Stop(); t.Dispose(); StartCapture(); };
@@ -3920,7 +4106,7 @@ public class MainForm : Form
             p.WaitForExit(3000);
             var m = _ffVerRx.Match(line);
             if (m.Success && int.TryParse(m.Groups[1].Value, out int major) && major < 4)
-                statusLabel.Text = $"⚠ ffmpeg {major}.x detected — recommend v4+";
+                statusLabel.Text = $"? ffmpeg {major}.x detected - recommend v4+";
         } catch { }
     }
 
